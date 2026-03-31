@@ -1,29 +1,29 @@
-active_profile: CMS
+active_profile: ISR
 profiles:
   ISR:
     data:
       loader_type: ISR
-      data_file: /Users/xiaogangyang/data/isr_rsm3d/Oct_22_2025/tiff
-      scans: '64'
-      spec_file: /Users/xiaogangyang/data/isr_rsm3d/FeTe_GeTe_101525
+      data_file: /Users/xiaogangyang/data/isr_rsm3d/data_6oct23_tiff
+      scans: '17'
+      spec_file: /Users/xiaogangyang/data/isr_rsm3d/setup_6oct23
       only_hkl: false
       cms_crop: null
       cms_angle_step: 1.0
     ExperimentSetup:
       distance: 0.78105
       pitch: 7.5e-05
-      ycenter: 185
-      xcenter: 257
-      xpixels: 514
-      ypixels: 384
+      ycenter: 66
+      xcenter: 125
+      xpixels: 232
+      ypixels: 320
       energy: 11.566
-      wavelength: 1.072
+      wavelength: 1.072000000000001
     Crystal:
-      ub: '-0.122354 1.6432 0.0160271
+      ub: '0.527257 -0.371243 0.00229402
 
-        -1.64319 -0.122757 0.0153525
+        -0.00521895 -0.0113961 -0.644724
 
-        0.0270981 -0.0243702 1.00332'
+        0.371213 0.527139 -0.0123226'
     build:
       ub_includes_2pi: true
       center_is_one_based: false
@@ -32,14 +32,14 @@ profiles:
     crop:
       enable: true
       y_min: 0
-      y_max: 384
+      y_max: 320
       x_min: 0
-      x_max: 514
+      x_max: 232
     regrid:
       space: hkl
-      grid_shape: 200,*,*
+      grid_shape: 100,*,*
       fuzzy: false
-      fuzzy_width: 0.01
+      fuzzy_width: 0.0
       normalize: mean
     view:
       log_view: true
@@ -49,11 +49,9 @@ profiles:
       contrast_hi: 99.8
     export:
       vtr_path: /Users/xiaogangyang/pyprojects/napari-resview
-      grid_path: /Users/xiaogangyang/data/cms_rsm3d/rsm3d_grid
-      edges_path: /Users/xiaogangyang/data/cms_rsm3d/rsm3d_edges
   CMS:
     data:
-      loader_type: CMS
+      loader_type: ISR
       data_file: /Users/xiaogangyang/data/cms_rsm3d/stitched3
       scans: 796715-797076
       spec_file: /Users/xiaogangyang/data/isr_rsm3d/setup_6oct23
@@ -61,12 +59,12 @@ profiles:
       cms_crop: null
       cms_angle_step: 0.5
     ExperimentSetup:
-      distance: 3.030008
+      distance: 3.03
       pitch: 0.000172
-      ycenter: 478
-      xcenter: 472
-      xpixels: 950
-      ypixels: 950
+      ycenter: 484
+      xcenter: 490
+      xpixels: 989
+      ypixels: 972
       energy: 13.49
       wavelength: 0.919
     Crystal:
@@ -82,10 +80,10 @@ profiles:
       detector_axes: z-
     crop:
       enable: true
-      y_min: 0
-      y_max: 950
-      x_min: 0
-      x_max: 950
+      y_min: 640
+      y_max: 1612
+      x_min: 244
+      x_max: 1233
     regrid:
       space: q
       grid_shape: 100,*,*
@@ -99,6 +97,4 @@ profiles:
       contrast_lo: 1.0
       contrast_hi: 99.8
     export:
-      vtr_path: /Users/xiaogangyang/data/cms_rsm3d/rsm3d_vtk
-      grid_path: /Users/xiaogangyang/data/cms_rsm3d/rsm3d_grid
-      edges_path: /Users/xiaogangyang/data/cms_rsm3d/rsm3d_edges
+      vtr_path: /Users/xiaogangyang/pyprojects/napari-resview
