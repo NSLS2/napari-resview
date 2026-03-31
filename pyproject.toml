@@ -5,7 +5,7 @@ description = "A napari plugin for 3D reciprocal space mapping"
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [
-  {name = "Xiaogang Yang"},
+  {name = "AUTHORS.rst" },
   {email = "yangxg@bnl.gov"},
 ]
 classifiers = [
@@ -30,21 +30,18 @@ requires-python = ">=3.10, <3.14"
 # See best practices: https://napari.org/stable/plugins/building_a_plugin/best_practices.html
 dependencies = [
     "numpy",
-    "magicgui",
+    "magicgui>=0.10.1",
+    "qtpy>=2.4.3",
     "xrayutilities==1.7.10",
-    "qtpy",
-    "scikit-image",
     "h5py",
     "hdf5plugin",
     "pyyaml>=6.0.3",
-    "qtpy>=2.4.3",
-    "pyside6>=6.8",
-    "pyqt6",
-    "magicgui>=0.10.1",
     "vtk>=9.0.0",
     "pandas>=2.3.3",
     "dask>=2024.8.0",
     "pyarrow>=21.0.0",
+    "tifffile",
+    "scipy",
 ]
 
 [project.optional-dependencies]
@@ -57,7 +54,7 @@ testing = [
     "pytest",  # https://docs.pytest.org/en/latest/contents.html
     "pytest-cov",  # https://pytest-cov.readthedocs.io/en/latest/
     "pytest-qt",  # https://pytest-qt.readthedocs.io/en/latest/
-    "napari[qt]",  # test with napari's default Qt bindings
+    "napari[qt]==0.7.0",  # test with napari's default Qt bindings
 ]
 
 [dependency-groups]
@@ -66,11 +63,10 @@ dev = [
     "pytest",  # https://docs.pytest.org/en/latest/contents.html
     "pytest-cov",  # https://pytest-cov.readthedocs.io/en/latest/
     "pytest-qt",  # https://pytest-qt.readthedocs.io/en/latest/
-    "napari[qt]",  # test with napari's default Qt bindings
+    "napari[qt]==0.7.0",  # test with napari's default Qt bindings
     "numpy",
     "magicgui",
     "h5py",
-    "scikit-image",
     "pyyaml",
     "qtpy",
 ]
@@ -109,6 +105,11 @@ xfail_strict = true
 # filterwarnings = ["error"]  # recommended by PP309; deprecation warnings cause failures so leaving for the user to enable if desired
 log_cli_level = "INFO"
 testpaths = ["tests"]
+# Speed up test discovery and collection
+norecursedirs = [".*", "build", "dist", "*.egg", "node_modules", ".tox"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
 
 [tool.black]
 line-length = 79
@@ -178,3 +179,6 @@ napari-resview = { path = ".", editable = true, extras = ["dev"] }
 
 [tool.pixi.feature.dev.tasks]
 napari = "napari"
+
+[tool.pixi.dependencies]
+tox = ">=4.49.1,<5"

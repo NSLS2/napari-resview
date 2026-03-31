@@ -25,11 +25,10 @@ What’s implemented in this version:
    - Downstream operations (build/regrid/view/export) work with cropped data directly
 
 4) View tab additions
-   - Stop: cancels the in-flight load worker and stops Run All chaining
+   - Stop: cancels the in-flight load worker
    - Refresh: re-runs View with current viewer settings
-   - Run All button size adjusted to fit the row better
 
-5) Async Load (thread_worker) + async-safe Run All chaining preserved.
+5) Async Load (thread_worker) preserved.
 
 NOTE:
 - This file assumes these imports exist in your package:
@@ -49,6 +48,7 @@ from typing import Any
 
 import napari
 import numpy as np
+import tifffile
 import yaml
 from magicgui.widgets import (
     CheckBox,
@@ -156,7 +156,7 @@ def _default_profile_doc(loader_type: str) -> dict[str, Any]:
             "contrast_lo": 1.0,
             "contrast_hi": 99.8,
         },
-        "export": {"vtr_path": None},
+        "export": {"vtr_path": None, "grid_path": None, "edges_path": None},
     }
 
 
@@ -365,6 +365,11 @@ def attach_dir_picker(fe: FileEdit, button: QtWidgets.QPushButton) -> None:
         else:
             show_warning("No folder selected.")
 
+    # Disconnect all existing click handlers
+    with contextlib.suppress(TypeError, RuntimeError):
+        button.clicked.disconnect()
+
+    # Connect our custom directory picker
     button.clicked.connect(pick_dir)
 
 
@@ -423,7 +428,7 @@ class ResviewDockWidget(QtWidgets.QWidget):
 
         # Worker + pipeline control
         self._load_worker_instance = None
-        self._run_all_pending = False
+        self._updating_beam_center = False  # Prevent recursive updates
 
         # ---------------------------------------------------------------------
         # DATA TAB (loader inputs + setup + crop)
@@ -521,7 +526,6 @@ class ResviewDockWidget(QtWidgets.QWidget):
         )
 
         # Crop moved to DATA tab
-        self.crop_enable_w = CheckBox(label="Crop before Build")
         self.y_min_w = SpinBox(label="H_t", min=0, max=10_000_000, step=1)
         self.y_max_w = SpinBox(label="H_b", min=0, max=10_000_000, step=1)
         self.x_min_w = SpinBox(label="W_l", min=0, max=10_000_000, step=1)
@@ -554,7 +558,6 @@ class ResviewDockWidget(QtWidgets.QWidget):
         crop_container = Container(
             layout="vertical",
             widgets=[
-                self.crop_enable_w,
                 crop_grid,
                 self.btn_crop_from_roi,
             ],
@@ -582,8 +585,8 @@ class ResviewDockWidget(QtWidgets.QWidget):
         data_lay.addWidget(self.isr_group)
         data_lay.addWidget(self.cms_group)
         data_lay.addWidget(self.setup_group)
-        data_lay.addWidget(self.crop_group)
         data_lay.addWidget(btn_row1)
+        data_lay.addWidget(self.crop_group)
         data_lay.addStretch(1)
 
         tab_data = make_scroll(data_inner)
@@ -780,7 +783,7 @@ class ResviewDockWidget(QtWidgets.QWidget):
         tab_build = make_scroll(build_inner)
 
         # ---------------------------------------------------------------------
-        # VIEW TAB (stop + refresh + adjusted Run All)
+        # VIEW TAB (stop + refresh)
         # ---------------------------------------------------------------------
         self.log_view_w = CheckBox(label="Log view")
         self.cmap_w = ComboBox(
@@ -804,29 +807,33 @@ class ResviewDockWidget(QtWidgets.QWidget):
         self.status_w = TextEdit(value="")
         with contextlib.suppress(AttributeError):
             self.status_w.native.setReadOnly(True)
-            self.status_w.native.setMinimumHeight(220)
+            self.status_w.native.setMinimumHeight(100)
+            # Set size policy to expand vertically
+            self.status_w.native.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Expanding,
+            )
 
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
 
-        self.export_vtr_w = FileEdit(mode="w", label="Output VTK (.vtr)")
+        self.export_vtr_w = FileEdit(mode="w", label="VTK (.vtr)")
         _ = set_file_button_symbol(self.export_vtr_w, "📂")
 
+        self.export_grid_w = FileEdit(mode="w", label="Grid (.tiff)")
+        _ = set_file_button_symbol(self.export_grid_w, "📂")
+
+        self.export_edges_w = FileEdit(mode="w", label="Grid+Edges (.npz)")
+        _ = set_file_button_symbol(self.export_edges_w, "📂")
+
         self.btn_view = PushButton(text="🔭 View RSM")
-        self.btn_export = PushButton(text="💾 Export to VTK")
+        self.btn_export = PushButton(text="💾 VTK")
+        self.btn_export_grid = PushButton(text="💾 TIFF")
+        self.btn_export_edges = PushButton(text="💾 NPZ")
 
         self.btn_stop = QtWidgets.QPushButton("Stop")
         self.btn_refresh = QtWidgets.QPushButton("Refresh")
-
-        self.btn_run_all_native = QtWidgets.QPushButton("Run All")
-        self.btn_run_all_native.setMinimumHeight(
-            34
-        )  # smaller to fit row better
-        self.btn_run_all_native.setMinimumWidth(110)
-        if self._icon is not None:
-            with contextlib.suppress(AttributeError):
-                self.btn_run_all_native.setIcon(self._icon)
 
         view_controls = Container(
             layout="vertical",
@@ -841,12 +848,34 @@ class ResviewDockWidget(QtWidgets.QWidget):
         )
         view_group = make_group("View", view_controls.native)
 
-        export_row = QtWidgets.QWidget()
-        export_lay = QtWidgets.QHBoxLayout(export_row)
-        export_lay.setContentsMargins(0, 0, 0, 0)
-        export_lay.setSpacing(8)
-        export_lay.addWidget(self.export_vtr_w.native)
-        export_lay.addWidget(self.btn_export.native)
+        export_vtr_row = QtWidgets.QWidget()
+        export_vtr_lay = QtWidgets.QHBoxLayout(export_vtr_row)
+        export_vtr_lay.setContentsMargins(0, 0, 0, 0)
+        export_vtr_lay.setSpacing(8)
+        export_vtr_lay.addWidget(self.export_vtr_w.native)
+        export_vtr_lay.addWidget(self.btn_export.native)
+
+        export_grid_row = QtWidgets.QWidget()
+        export_grid_lay = QtWidgets.QHBoxLayout(export_grid_row)
+        export_grid_lay.setContentsMargins(0, 0, 0, 0)
+        export_grid_lay.setSpacing(8)
+        export_grid_lay.addWidget(self.export_grid_w.native)
+        export_grid_lay.addWidget(self.btn_export_grid.native)
+
+        export_edges_row = QtWidgets.QWidget()
+        export_edges_lay = QtWidgets.QHBoxLayout(export_edges_row)
+        export_edges_lay.setContentsMargins(0, 0, 0, 0)
+        export_edges_lay.setSpacing(8)
+        export_edges_lay.addWidget(self.export_edges_w.native)
+        export_edges_lay.addWidget(self.btn_export_edges.native)
+
+        export_container = QtWidgets.QWidget()
+        export_container_lay = QtWidgets.QVBoxLayout(export_container)
+        export_container_lay.setContentsMargins(0, 0, 0, 0)
+        export_container_lay.setSpacing(4)
+        export_container_lay.addWidget(export_vtr_row)
+        export_container_lay.addWidget(export_grid_row)
+        export_container_lay.addWidget(export_edges_row)
 
         action_row = QtWidgets.QWidget()
         action_lay = QtWidgets.QHBoxLayout(action_row)
@@ -856,34 +885,224 @@ class ResviewDockWidget(QtWidgets.QWidget):
         action_lay.addWidget(self.btn_refresh)
         action_lay.addWidget(self.btn_stop)
         action_lay.addStretch(1)
-        action_lay.addWidget(self.btn_run_all_native)
 
         view_inner = QtWidgets.QWidget()
         view_lay = QtWidgets.QVBoxLayout(view_inner)
         view_lay.setContentsMargins(0, 0, 0, 0)
         view_lay.setSpacing(10)
         view_lay.addWidget(view_group)
-        view_lay.addWidget(make_group("Status / Output", self.status_w.native))
-        view_lay.addWidget(self.progress)
-        view_lay.addWidget(make_group("Export", export_row))
+        view_lay.addWidget(make_group("Export", export_container))
         view_lay.addWidget(action_row)
         view_lay.addStretch(1)
 
         tab_view = make_scroll(view_inner)
+
+        # =====================================================================
+        # Analysis Tab - 3D Slicing
+        # =====================================================================
+        # Dynamic axis labels (updated when RSM viewer is created)
+        self.slice_axis1_label = Label(value="<b>H (X) Position:</b>")
+        self.slice_axis2_label = Label(value="<b>K (Y) Position:</b>")
+        self.slice_axis3_label = Label(value="<b>L (Z) Position:</b>")
+
+        # Sliders for each axis (ranges will be updated dynamically)
+        self.slice_h_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slice_h_slider.setMinimum(0)
+        self.slice_h_slider.setMaximum(100)
+        self.slice_h_slider.setValue(50)
+        self.slice_h_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.slice_h_slider.setTickInterval(10)
+
+        self.slice_k_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slice_k_slider.setMinimum(0)
+        self.slice_k_slider.setMaximum(100)
+        self.slice_k_slider.setValue(50)
+        self.slice_k_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.slice_k_slider.setTickInterval(10)
+
+        self.slice_l_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slice_l_slider.setMinimum(0)
+        self.slice_l_slider.setMaximum(100)
+        self.slice_l_slider.setValue(50)
+        self.slice_l_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.slice_l_slider.setTickInterval(10)
+
+        # Value display labels
+        self.slice_h_value_label = Label(value="0.00")
+        self.slice_k_value_label = Label(value="0.00")
+        self.slice_l_value_label = Label(value="0.00")
+
+        # Visibility checkboxes
+        self.slice_h_visible = CheckBox(label="Show", value=False)
+        self.slice_k_visible = CheckBox(label="Show", value=False)
+        self.slice_l_visible = CheckBox(label="Show", value=False)
+
+        # Slicing parameters
+        self.slice_opacity_w = FloatSpinBox(
+            label="Opacity", min=0.0, max=1.0, step=0.1, value=0.8
+        )
+        self.slice_cmap_w = ComboBox(
+            label="Colormap",
+            choices=["turbo", "viridis", "inferno", "plasma", "gray", "hsv"],
+        )
+        self.slice_cmap_w.value = "turbo"
+
+        # Border controls
+        self.slice_show_border_w = CheckBox(label="Show Border", value=True)
+
+        # Create layout for axis 1 (H or Qx)
+        axis1_row = QtWidgets.QWidget()
+        axis1_lay = QtWidgets.QHBoxLayout(axis1_row)
+        axis1_lay.setContentsMargins(0, 0, 0, 0)
+        axis1_lay.addWidget(self.slice_h_slider)
+        axis1_lay.addWidget(self.slice_h_value_label.native)
+        axis1_lay.addWidget(self.slice_h_visible.native)
+
+        # Create layout for axis 2 (K or Qy)
+        axis2_row = QtWidgets.QWidget()
+        axis2_lay = QtWidgets.QHBoxLayout(axis2_row)
+        axis2_lay.setContentsMargins(0, 0, 0, 0)
+        axis2_lay.addWidget(self.slice_k_slider)
+        axis2_lay.addWidget(self.slice_k_value_label.native)
+        axis2_lay.addWidget(self.slice_k_visible.native)
+
+        # Create layout for axis 3 (L or Qz)
+        axis3_row = QtWidgets.QWidget()
+        axis3_lay = QtWidgets.QHBoxLayout(axis3_row)
+        axis3_lay.setContentsMargins(0, 0, 0, 0)
+        axis3_lay.addWidget(self.slice_l_slider)
+        axis3_lay.addWidget(self.slice_l_value_label.native)
+        axis3_lay.addWidget(self.slice_l_visible.native)
+
+        # Orthogonal Slicing Container
+        orthogonal_inner = QtWidgets.QWidget()
+        orthogonal_lay = QtWidgets.QVBoxLayout(orthogonal_inner)
+        orthogonal_lay.setContentsMargins(0, 0, 0, 0)
+        orthogonal_lay.setSpacing(8)
+        orthogonal_lay.addWidget(self.slice_axis1_label.native)
+        orthogonal_lay.addWidget(axis1_row)
+        orthogonal_lay.addWidget(self.slice_axis2_label.native)
+        orthogonal_lay.addWidget(axis2_row)
+        orthogonal_lay.addWidget(self.slice_axis3_label.native)
+        orthogonal_lay.addWidget(axis3_row)
+        # Add parameters directly without sub-group
+        orthogonal_lay.addWidget(self.slice_opacity_w.native)
+        orthogonal_lay.addWidget(self.slice_cmap_w.native)
+        orthogonal_lay.addWidget(self.slice_show_border_w.native)
+
+        # Cylindrical Slicing Controls (Q space only)
+        self.cylinder_radius_w = FloatSpinBox(
+            label="Cylinder Radius (Å⁻¹)",
+            min=0.0,
+            max=10.0,
+            step=0.01,
+            value=1.0,
+        )
+        self.cylinder_visible = CheckBox(label="Show Cylinder", value=False)
+        self.cylinder_samples_w = SpinBox(
+            label="Angular Samples", min=16, max=360, step=8, value=64
+        )
+        self.cylinder_opacity_w = FloatSpinBox(
+            label="Opacity", min=0.0, max=1.0, step=0.1, value=0.7
+        )
+        self.cylinder_cmap_w = ComboBox(
+            label="Colormap",
+            choices=["turbo", "viridis", "inferno", "plasma", "gray", "hsv"],
+        )
+        self.cylinder_cmap_w.value = "plasma"
+
+        cylinder_inner = QtWidgets.QWidget()
+        cylinder_lay = QtWidgets.QVBoxLayout(cylinder_inner)
+        cylinder_lay.setContentsMargins(0, 0, 0, 0)
+        cylinder_lay.setSpacing(8)
+        cylinder_params_container = Container(
+            layout="vertical",
+            widgets=[
+                self.cylinder_radius_w,
+                self.cylinder_samples_w,
+                self.cylinder_opacity_w,
+                self.cylinder_cmap_w,
+                self.cylinder_visible,
+            ],
+        )
+        cylinder_lay.addWidget(cylinder_params_container.native)
+
+        # Spherical Slicing Controls (Q space only)
+        self.sphere_radius_w = FloatSpinBox(
+            label="Sphere Radius (Å⁻¹)",
+            min=0.0,
+            max=10.0,
+            step=0.01,
+            value=1.0,
+        )
+        self.sphere_visible = CheckBox(label="Show Sphere", value=False)
+        self.sphere_samples_w = SpinBox(
+            label="Angular Samples", min=16, max=180, step=8, value=64
+        )
+        self.sphere_opacity_w = FloatSpinBox(
+            label="Opacity", min=0.0, max=1.0, step=0.1, value=0.7
+        )
+        self.sphere_cmap_w = ComboBox(
+            label="Colormap",
+            choices=["turbo", "viridis", "inferno", "plasma", "gray", "hsv"],
+        )
+        self.sphere_cmap_w.value = "viridis"
+
+        sphere_inner = QtWidgets.QWidget()
+        sphere_lay = QtWidgets.QVBoxLayout(sphere_inner)
+        sphere_lay.setContentsMargins(0, 0, 0, 0)
+        sphere_lay.setSpacing(8)
+        sphere_params_container = Container(
+            layout="vertical",
+            widgets=[
+                self.sphere_radius_w,
+                self.sphere_samples_w,
+                self.sphere_opacity_w,
+                self.sphere_cmap_w,
+                self.sphere_visible,
+            ],
+        )
+        sphere_lay.addWidget(sphere_params_container.native)
+
+        analysis_inner = QtWidgets.QWidget()
+        analysis_lay = QtWidgets.QVBoxLayout(analysis_inner)
+        analysis_lay.setContentsMargins(0, 0, 0, 0)
+        analysis_lay.setSpacing(10)
+        analysis_lay.addWidget(
+            make_group("Orthogonal Slicing", orthogonal_inner)
+        )
+        analysis_lay.addWidget(
+            make_group("Cylindrical Slicing (Q space only)", cylinder_inner)
+        )
+        analysis_lay.addWidget(
+            make_group("Spherical Slicing (Q space only)", sphere_inner)
+        )
+        analysis_lay.addStretch(1)
+
+        tab_analysis = make_scroll(analysis_inner)
 
         # Tabs
         tabs = QtWidgets.QTabWidget()
         tabs.addTab(tab_data, "Data")
         tabs.addTab(tab_build, "Build")
         tabs.addTab(tab_view, "View")
+        tabs.addTab(tab_analysis, "Analysis")
+
+        # Set size policy for tabs to take 2/3 of space
+        tabs.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(6)
-        outer.addWidget(tabs)
+        outer.addWidget(tabs, stretch=11)  # 11/12 of space
 
-        self.status_bar = QtWidgets.QStatusBar()
-        outer.addWidget(self.status_bar)
+        # Status output (1/12 of space, visible from all tabs)
+        outer.addWidget(make_group("Status", self.status_w.native), stretch=1)
+
+        # Progress bar at the very bottom
+        outer.addWidget(self.progress)
 
         # ---------------------------------------------------------------------
         # YAML <-> UI binding (NOTE: map includes crop in Data tab and UB in Build tab)
@@ -915,7 +1134,6 @@ class ResviewDockWidget(QtWidgets.QWidget):
                 "detector_axes": self.detector_axes_w,
             },
             "crop": {
-                "enable": self.crop_enable_w,
                 "y_min": self.y_min_w,
                 "y_max": self.y_max_w,
                 "x_min": self.x_min_w,
@@ -935,7 +1153,11 @@ class ResviewDockWidget(QtWidgets.QWidget):
                 "contrast_lo": self.contrast_lo_w,
                 "contrast_hi": self.contrast_hi_w,
             },
-            "export": {"vtr_path": self.export_vtr_w},
+            "export": {
+                "vtr_path": self.export_vtr_w,
+                "grid_path": self.export_grid_w,
+                "edges_path": self.export_edges_w,
+            },
         }
 
         # Apply active profile from YAML to UI on startup
@@ -954,9 +1176,37 @@ class ResviewDockWidget(QtWidgets.QWidget):
         self.btn_regrid.clicked.connect(self.on_regrid)
         self.btn_view.clicked.connect(self.on_view)
         self.btn_export.clicked.connect(self.on_export_vtk)
-        self.btn_run_all_native.clicked.connect(self.on_run_all)
+        self.btn_export_grid.clicked.connect(self.on_export_grid)
+        self.btn_export_edges.clicked.connect(self.on_export_edges)
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_refresh.clicked.connect(self.on_refresh)
+
+        # Connect slicing controls
+        self.slice_h_slider.valueChanged.connect(self._on_slice_h_changed)
+        self.slice_k_slider.valueChanged.connect(self._on_slice_k_changed)
+        self.slice_l_slider.valueChanged.connect(self._on_slice_l_changed)
+        self.slice_h_visible.changed.connect(self._on_slice_visibility_changed)
+        self.slice_show_border_w.changed.connect(
+            self._on_slice_visibility_changed
+        )
+        self.slice_k_visible.changed.connect(self._on_slice_visibility_changed)
+        self.slice_l_visible.changed.connect(self._on_slice_visibility_changed)
+
+        # Connect cylindrical surface controls
+        self.cylinder_visible.changed.connect(
+            self._on_cylinder_visibility_changed
+        )
+        self.cylinder_radius_w.changed.connect(
+            self._on_cylinder_params_changed
+        )
+        self.cylinder_samples_w.changed.connect(
+            self._on_cylinder_params_changed
+        )
+
+        # Connect spherical surface controls
+        self.sphere_visible.changed.connect(self._on_sphere_visibility_changed)
+        self.sphere_radius_w.changed.connect(self._on_sphere_params_changed)
+        self.sphere_samples_w.changed.connect(self._on_sphere_params_changed)
 
         # Note: Crop geometry updates to detector size and beam center are now only
         # applied when the user clicks "Crop from ROI" button, not automatically
@@ -985,6 +1235,10 @@ class ResviewDockWidget(QtWidgets.QWidget):
 
         self.energy_w.changed.connect(_on_energy_changed)
         self.wavelength_w.changed.connect(_on_wavelength_changed)
+
+        # Connect beam center widgets to update cross position
+        self.ycenter_w.changed.connect(self._on_beam_center_widget_changed)
+        self.xcenter_w.changed.connect(self._on_beam_center_widget_changed)
 
         # Initial visibility
         self._update_loader_visibility()
@@ -1270,8 +1524,7 @@ class ResviewDockWidget(QtWidgets.QWidget):
     # Crop geometry application (beamcenter + detector size)
     # -----------------------------------------------------------------------------
     def _crop_bounds_valid(self) -> bool:
-        if not bool(self.crop_enable_w.value):
-            return False
+        """DEPRECATED: Not currently used."""
         ymin, ymax = int(self.y_min_w.value), int(self.y_max_w.value)
         xmin, xmax = int(self.x_min_w.value), int(self.x_max_w.value)
         if ymin < 0 or xmin < 0:
@@ -1341,7 +1594,6 @@ class ResviewDockWidget(QtWidgets.QWidget):
     def status(self, msg: str) -> None:
         with contextlib.suppress(AttributeError):
             self.status_w.native.append(msg)
-        self.status_bar.showMessage(msg, 3000)
         logger.info("ResView: %s", msg)
 
     def set_progress(self, value: int | None, *, busy: bool = False) -> None:
@@ -1359,10 +1611,11 @@ class ResviewDockWidget(QtWidgets.QWidget):
             self.btn_regrid,
             self.btn_view,
             self.btn_export,
+            self.btn_export_grid,
+            self.btn_export_edges,
         ):
             with contextlib.suppress(AttributeError):
                 btn.native.setEnabled(not b)
-        self.btn_run_all_native.setEnabled(not b)
         self.btn_stop.setEnabled(True)
 
     # -------------------------------------------------------------------------
@@ -1456,18 +1709,34 @@ class ResviewDockWidget(QtWidgets.QWidget):
                         H, W = first_frame.shape[-2], first_frame.shape[-1]
                         self.ypixels_w.value = int(H)
                         self.xpixels_w.value = int(W)
+                        # Set beam center to detector center
+                        self.ycenter_w.value = int(H / 2)
+                        self.xcenter_w.value = int(W / 2)
                         logger.info(
                             "Updated detector size from loaded data: %sx%s",
                             H,
                             W,
+                        )
+                        logger.info(
+                            "Set beam center to detector center: (%s, %s)",
+                            self.ycenter_w.value,
+                            self.xcenter_w.value,
                         )
                 elif hasattr(frames, "shape") and len(frames.shape) >= 2:
                     # frames is a numpy array (T, H, W) or (H, W)
                     H, W = frames.shape[-2], frames.shape[-1]
                     self.ypixels_w.value = int(H)
                     self.xpixels_w.value = int(W)
+                    # Set beam center to detector center
+                    self.ycenter_w.value = int(H / 2)
+                    self.xcenter_w.value = int(W / 2)
                     logger.info(
                         "Updated detector size from loaded data: %sx%s", H, W
+                    )
+                    logger.info(
+                        "Set beam center to detector center: (%s, %s)",
+                        self.ycenter_w.value,
+                        self.xcenter_w.value,
                     )
 
             # update UB in UI
@@ -1498,26 +1767,17 @@ class ResviewDockWidget(QtWidgets.QWidget):
         finally:
             self.set_busy(False)
 
-        if self._run_all_pending:
-            self.status("Run All: starting Build…")
-            QtCore.QTimer.singleShot(0, self._run_all_build)
-
     def _on_worker_error(self, e: BaseException) -> None:
         self.set_progress(0, busy=False)
         self.set_busy(False)
         self.status(f"Error: {e}")
         show_error(str(e))
-        if self._run_all_pending:
-            self._run_all_pending = False
-            self.btn_run_all_native.setEnabled(True)
 
     # -------------------------------------------------------------------------
     # Actions
     # -------------------------------------------------------------------------
     def on_stop(self) -> None:
-        """Stop in-flight load + stop Run All chaining."""
-        self._run_all_pending = False
-
+        """Stop in-flight load worker."""
         worker = self._load_worker_instance
         if worker is not None:
             # napari worker supports quit(); also try .cancel() if present
@@ -1526,7 +1786,6 @@ class ResviewDockWidget(QtWidgets.QWidget):
             with contextlib.suppress(AttributeError):
                 worker.cancel()
 
-        self.btn_run_all_native.setEnabled(True)
         self.set_progress(0, busy=False)
         self.status("Stopped.")
 
@@ -1601,6 +1860,31 @@ class ResviewDockWidget(QtWidgets.QWidget):
             )
             intensity_viewer.launch(viewer=self.viewer)
             self._state["intensity_viewer"] = intensity_viewer
+
+            # Add beam center cross marker
+            beam_y = float(self.ycenter_w.value or 0)
+            beam_x = float(self.xcenter_w.value or 0)
+            cross_size = 40  # Length of cross arms in pixels (doubled)
+            # Create cross as two perpendicular lines
+            vertical_line = np.array(
+                [[beam_y - cross_size, beam_x], [beam_y + cross_size, beam_x]]
+            )
+            horizontal_line = np.array(
+                [[beam_y, beam_x - cross_size], [beam_y, beam_x + cross_size]]
+            )
+            beam_center_layer = self.viewer.add_shapes(
+                [vertical_line, horizontal_line],
+                shape_type="line",
+                edge_color="white",
+                edge_width=2,
+                name="Beam Center",
+            )
+            beam_center_layer.editable = True
+            beam_center_layer.mode = "select"
+            self._state["beam_center_layer"] = beam_center_layer
+
+            # Connect beam center layer changes to update UI
+            beam_center_layer.events.data.connect(self._on_beam_center_dragged)
 
             # Connect ROI change events to auto-update crop widgets
             roi_layer = getattr(intensity_viewer, "_roi_layer", None)
@@ -1687,6 +1971,116 @@ class ResviewDockWidget(QtWidgets.QWidget):
         except (AttributeError, IndexError, ValueError) as e:
             logger.debug("_on_roi_changed: Error %s", e)
 
+    def _on_beam_center_dragged(self, _event=None) -> None:
+        """Update UI widgets when beam center is dragged."""
+        if self._updating_beam_center:
+            return
+        beam_center_layer = self._state.get("beam_center_layer")
+        if beam_center_layer is None or not beam_center_layer.data:
+            return
+        try:
+            self._updating_beam_center = True
+            # The cross consists of two lines (vertical and horizontal)
+            # Detect which line was moved and extract center from it
+            vertical_line = beam_center_layer.data[0]
+            horizontal_line = beam_center_layer.data[1]
+
+            # Get center from vertical line (middle of y-coordinates, constant x)
+            v_center_y = float((vertical_line[0][0] + vertical_line[1][0]) / 2)
+            v_center_x = float(vertical_line[0][1])
+
+            # Get center from horizontal line (constant y, middle of x-coordinates)
+            h_center_y = float(horizontal_line[0][0])
+            h_center_x = float(
+                (horizontal_line[0][1] + horizontal_line[1][1]) / 2
+            )
+
+            # Use whichever line was moved (has different center from the other)
+            # Default to vertical line if both match
+            if (
+                abs(v_center_y - h_center_y) > 0.5
+                or abs(v_center_x - h_center_x) > 0.5
+            ):
+                # Lines don't match - one was dragged
+                # Use vertical line's position to update everything
+                beam_y = v_center_y
+                beam_x = v_center_x
+            else:
+                # Both lines match, use vertical line
+                beam_y = v_center_y
+                beam_x = v_center_x
+
+            # Update UI widgets if values changed
+            new_y = int(round(beam_y))
+            new_x = int(round(beam_x))
+            if self.ycenter_w.value != new_y:
+                self.ycenter_w.value = new_y
+            if self.xcenter_w.value != new_x:
+                self.xcenter_w.value = new_x
+
+            # Schedule a delayed sync to fix both lines after drag completes
+            # This avoids interfering with napari's drag operation
+            QtCore.QTimer.singleShot(100, self._sync_beam_center_cross)
+
+        except (AttributeError, IndexError, ValueError) as e:
+            logger.debug("_on_beam_center_dragged: Error %s", e)
+        finally:
+            self._updating_beam_center = False
+
+    def _sync_beam_center_cross(self) -> None:
+        """Synchronize both cross lines to be centered at the current beam center."""
+        if self._updating_beam_center:
+            return
+        beam_center_layer = self._state.get("beam_center_layer")
+        if beam_center_layer is None:
+            return
+        try:
+            self._updating_beam_center = True
+            beam_y = float(self.ycenter_w.value or 0)
+            beam_x = float(self.xcenter_w.value or 0)
+            cross_size = 40
+
+            # Create properly centered cross lines
+            new_vertical = np.array(
+                [[beam_y - cross_size, beam_x], [beam_y + cross_size, beam_x]]
+            )
+            new_horizontal = np.array(
+                [[beam_y, beam_x - cross_size], [beam_y, beam_x + cross_size]]
+            )
+            beam_center_layer.data = [new_vertical, new_horizontal]
+        except (AttributeError, ValueError) as e:
+            logger.debug("_sync_beam_center_cross: Error %s", e)
+        finally:
+            self._updating_beam_center = False
+
+    def _on_beam_center_widget_changed(self, _event=None) -> None:
+        """Update beam center cross position when UI widgets change."""
+        if self._updating_beam_center:
+            return
+        beam_center_layer = self._state.get("beam_center_layer")
+        if beam_center_layer is None:
+            return
+        try:
+            self._updating_beam_center = True
+            beam_y = float(self.ycenter_w.value or 0)
+            beam_x = float(self.xcenter_w.value or 0)
+            cross_size = 40  # Doubled cross size
+
+            # Create new cross lines
+            vertical_line = np.array(
+                [[beam_y - cross_size, beam_x], [beam_y + cross_size, beam_x]]
+            )
+            horizontal_line = np.array(
+                [[beam_y, beam_x - cross_size], [beam_y, beam_x + cross_size]]
+            )
+
+            # Update the shapes layer data
+            beam_center_layer.data = [vertical_line, horizontal_line]
+        except (AttributeError, ValueError) as e:
+            logger.debug("_on_beam_center_widget_changed: Error %s", e)
+        finally:
+            self._updating_beam_center = False
+
     def on_crop_from_roi(self) -> None:
         """Copy ROI rectangle bounds to crop widgets and update detector size + beam center."""
         intensity_viewer = self._state.get("intensity_viewer")
@@ -1722,7 +2116,6 @@ class ResviewDockWidget(QtWidgets.QWidget):
             self.y_max_w.value = y_max
             self.x_min_w.value = x_min
             self.x_max_w.value = x_max
-            self.crop_enable_w.value = True
 
             # Get current beam center
             old_yc = int(self.ycenter_w.value)
@@ -1830,6 +2223,32 @@ class ResviewDockWidget(QtWidgets.QWidget):
         if setup is None or df is None:
             show_error("Load data first.")
             return
+
+        # Sync UI widget values to setup object before building
+        # This ensures any changes made in the Data tab (e.g., from crop) are used
+        try:
+            setup.ypixels = int(self.ypixels_w.value)
+            setup.xpixels = int(self.xpixels_w.value)
+            setup.ycenter = int(self.ycenter_w.value)
+            setup.xcenter = int(self.xcenter_w.value)
+            setup.distance = float(self.distance_w.value)
+            setup.pitch = float(self.pitch_w.value)
+            setup.energy = float(self.energy_w.value)
+            # Only update wavelength if it's set (non-zero)
+            if float(self.wavelength_w.value or 0) > 0:
+                setup.wavelength = float(self.wavelength_w.value)
+            self._state["setup"] = setup
+            logger.info(
+                "Synced UI to setup: detector=%dx%d, center=(%d, %d), dist=%.4f, energy=%.3f",
+                setup.xpixels,
+                setup.ypixels,
+                setup.xcenter,
+                setup.ycenter,
+                setup.distance,
+                setup.energy,
+            )
+        except (AttributeError, TypeError, ValueError) as sync_err:
+            logger.warning("Failed to sync UI to setup: %s", sync_err)
 
         self.set_busy(True)
         self.set_progress(None, busy=True)
@@ -1964,12 +2383,471 @@ class ResviewDockWidget(QtWidgets.QWidget):
             )
             viewer_local = viz.launch(viewer=self.viewer)
             self._state["rsm_viewer"] = viewer_local
+            self._state["rsm_viz"] = viz  # Store viz object for slicing
+
+            # Update slicing controls based on RSM space and axis ranges
+            self._update_slice_controls(viz)
+
             self.set_progress(100, busy=False)
             self.status("RSM viewer opened.")
         except (RuntimeError, ValueError, TypeError) as e:
             show_error(f"View error: {e}")
             self.set_progress(80, busy=False)
             self.status(f"View failed: {e}")
+
+    def _update_slice_controls(self, viz: RSMNapariViewer) -> None:
+        """Update slicing controls based on RSM space and axis ranges."""
+        # Update axis labels based on space
+        if viz.space == "hkl":
+            self.slice_axis1_label.value = "<b>H (X) Position:</b>"
+            self.slice_axis2_label.value = "<b>K (Y) Position:</b>"
+            self.slice_axis3_label.value = "<b>L (Z) Position:</b>"
+        else:  # q space
+            self.slice_axis1_label.value = "<b>Qx Position:</b>"
+            self.slice_axis2_label.value = "<b>Qy Position:</b>"
+            self.slice_axis3_label.value = "<b>Qz Position:</b>"
+
+        # Store axis ranges for slider conversion
+        self._slice_h_range = (float(viz.xax.min()), float(viz.xax.max()))
+        self._slice_k_range = (float(viz.yax.min()), float(viz.yax.max()))
+        self._slice_l_range = (float(viz.zax.min()), float(viz.zax.max()))
+
+        # Set slider to middle position
+        self.slice_h_slider.setValue(50)
+        self.slice_k_slider.setValue(50)
+        self.slice_l_slider.setValue(50)
+
+        # Update value labels
+        self._on_slice_h_changed(50)
+        self._on_slice_k_changed(50)
+        self._on_slice_l_changed(50)
+
+        # Reset visibility
+        self.slice_h_visible.value = False
+        self.slice_k_visible.value = False
+        self.slice_l_visible.value = False
+        self.cylinder_visible.value = False
+        self.sphere_visible.value = False
+
+        # Update cylinder and sphere radius ranges for Q space
+        if viz.space == "q":
+            # Calculate maximum radius from Qx, Qy ranges (for cylinder)
+            max_qx = max(abs(viz.xax.min()), abs(viz.xax.max()))
+            max_qy = max(abs(viz.yax.min()), abs(viz.yax.max()))
+            max_radius_cylinder = np.sqrt(max_qx**2 + max_qy**2)
+            self.cylinder_radius_w.max = float(max_radius_cylinder)
+            # Set default to a reasonable value
+            self.cylinder_radius_w.value = min(
+                1.0, float(max_radius_cylinder * 0.5)
+            )
+
+            # Calculate maximum radius from origin (for sphere)
+            max_qz = max(abs(viz.zax.min()), abs(viz.zax.max()))
+            max_radius_sphere = np.sqrt(max_qx**2 + max_qy**2 + max_qz**2)
+            self.sphere_radius_w.max = float(max_radius_sphere)
+            # Set default to a reasonable value
+            self.sphere_radius_w.value = min(
+                1.0, float(max_radius_sphere * 0.5)
+            )
+
+        # Clear existing slice layers
+        self._clear_slice_layers()
+
+    def _slider_to_coord(self, slider_value: int, axis_range: tuple) -> float:
+        """Convert slider value (0-100) to coordinate value."""
+        fraction = slider_value / 100.0
+        return axis_range[0] + fraction * (axis_range[1] - axis_range[0])
+
+    def _on_slice_h_changed(self, value: int) -> None:
+        """Update H/Qx slice value label."""
+        if hasattr(self, "_slice_h_range"):
+            coord = self._slider_to_coord(value, self._slice_h_range)
+            self.slice_h_value_label.value = f"{coord:.3f}"
+            if self.slice_h_visible.value:
+                self._update_slice("h", coord)
+
+    def _on_slice_k_changed(self, value: int) -> None:
+        """Update K/Qy slice value label."""
+        if hasattr(self, "_slice_k_range"):
+            coord = self._slider_to_coord(value, self._slice_k_range)
+            self.slice_k_value_label.value = f"{coord:.3f}"
+            if self.slice_k_visible.value:
+                self._update_slice("k", coord)
+
+    def _on_slice_l_changed(self, value: int) -> None:
+        """Update L/Qz slice value label."""
+        if hasattr(self, "_slice_l_range"):
+            coord = self._slider_to_coord(value, self._slice_l_range)
+            self.slice_l_value_label.value = f"{coord:.3f}"
+            if self.slice_l_visible.value:
+                self._update_slice("l", coord)
+
+    def _on_slice_visibility_changed(self) -> None:
+        """Handle slice visibility checkbox changes."""
+        if self.slice_h_visible.value:
+            coord = self._slider_to_coord(
+                self.slice_h_slider.value(), self._slice_h_range
+            )
+            self._update_slice("h", coord)
+        else:
+            self._remove_slice_layer("h")
+
+        if self.slice_k_visible.value:
+            coord = self._slider_to_coord(
+                self.slice_k_slider.value(), self._slice_k_range
+            )
+            self._update_slice("k", coord)
+        else:
+            self._remove_slice_layer("k")
+
+        if self.slice_l_visible.value:
+            coord = self._slider_to_coord(
+                self.slice_l_slider.value(), self._slice_l_range
+            )
+            self._update_slice("l", coord)
+        else:
+            self._remove_slice_layer("l")
+
+    def _should_show_border(self) -> bool:
+        """Check if borders should be shown."""
+        return (
+            bool(self.slice_show_border_w.value)
+            if hasattr(self, "slice_show_border_w")
+            else True
+        )
+
+    def _update_slice(self, axis: str, position: float) -> None:
+        """Update or create a slice for the given axis."""
+        viz = self._state.get("rsm_viz")
+        if viz is None:
+            return
+
+        # Remove existing slice for this axis
+        self._remove_slice_layer(axis)
+
+        # Add new slice with border if enabled
+        opacity = float(self.slice_opacity_w.value)
+        colormap = self.slice_cmap_w.value
+        add_border = self._should_show_border()
+
+        try:
+            layers = viz.add_slices(
+                axis=axis,
+                positions=[position],
+                opacity=opacity,
+                colormap=colormap,
+                name_prefix=f"slice_{axis}",
+                add_border=add_border,
+            )
+            # Store layer reference for later removal
+            if layers:
+                self._state[f"slice_layer_{axis}"] = layers[0]
+        except (RuntimeError, ValueError, TypeError, IndexError) as e:
+            logger.warning("Failed to update slice %s: %s", axis, e)
+
+    def _remove_slice_layer(self, axis: str) -> None:
+        """Remove slice layer for the given axis."""
+        layer = self._state.get(f"slice_layer_{axis}")
+        if layer is not None and self.viewer is not None:
+            with contextlib.suppress(ValueError, KeyError):
+                self.viewer.layers.remove(layer)
+            self._state[f"slice_layer_{axis}"] = None
+
+    def _clear_slice_layers(self) -> None:
+        """Clear all slice layers, cylinder layer, and sphere layer."""
+        self._remove_slice_layer("h")
+        self._remove_slice_layer("k")
+        self._remove_slice_layer("l")
+        self._remove_cylinder_layer()
+        self._remove_sphere_layer()
+
+    def _on_cylinder_visibility_changed(self) -> None:
+        """Handle cylindrical surface visibility checkbox changes."""
+        if self.cylinder_visible.value:
+            self._update_cylinder_surface()
+        else:
+            self._remove_cylinder_layer()
+
+    def _on_cylinder_params_changed(self) -> None:
+        """Handle changes to cylinder parameters (radius, samples)."""
+        if self.cylinder_visible.value:
+            self._update_cylinder_surface()
+
+    def _update_cylinder_surface(self) -> None:
+        """Extract and display cylindrical surface data as a triangulated mesh."""
+        viz = self._state.get("rsm_viz")
+        if viz is None:
+            return
+
+        # Check if we're in Q space
+        if viz.space != "q":
+            show_warning("Cylindrical surface is only available in Q space")
+            self.cylinder_visible.value = False
+            return
+
+        # Get parameters
+        radius = float(self.cylinder_radius_w.value)
+        n_samples = int(self.cylinder_samples_w.value)
+        opacity = float(self.cylinder_opacity_w.value)
+        colormap = str(self.cylinder_cmap_w.value)
+
+        # Remove existing cylinder layer
+        self._remove_cylinder_layer()
+
+        try:
+            # Extract cylindrical surface data as mesh
+            vertices, faces, values = self._extract_cylindrical_surface_mesh(
+                viz, radius, n_samples
+            )
+
+            if vertices is None or len(vertices) == 0:
+                show_warning(f"No data found at radius {radius:.3f} Å⁻¹")
+                return
+
+            # Add to viewer as Surface layer
+            layer = viz.viewer.add_surface(
+                (vertices, faces, values),
+                name=f"Cylinder_R={radius:.3f}",
+                colormap=colormap,
+                opacity=opacity,
+                shading="smooth",
+            )
+
+            # Store reference
+            self._state["cylinder_layer"] = layer
+            logger.info(
+                "Added cylindrical surface at radius %.3f Å⁻¹ with %d vertices and %d faces",
+                radius,
+                len(vertices),
+                len(faces),
+            )
+        except (RuntimeError, ValueError, TypeError) as e:
+            show_error(f"Failed to create cylindrical surface: {e}")
+            logger.error("Cylinder surface error: %s", e)
+
+    def _extract_cylindrical_surface_mesh(
+        self, viz, radius: float, n_samples: int
+    ) -> tuple:
+        """
+        Extract cylindrical surface data as a triangulated mesh.
+
+        Returns (vertices, faces, values) where:
+        - vertices: Nx3 array of (Qz, Qy, Qx) coordinates
+        - faces: Mx3 array of triangle vertex indices
+        - values: N array of intensity values at each vertex
+        """
+        # Get grid and axes
+        qx = viz.xax
+        qy = viz.yax
+        qz = viz.zax
+
+        # Extract data using log view if enabled
+        data = viz._log1p_clip(viz.volume) if viz.log_view else viz.volume
+
+        # Create angular samples (close the loop by including 0 at the end)
+        theta = np.linspace(0, 2 * np.pi, n_samples + 1)
+        n_theta = len(theta)
+        n_qz = len(qz)
+
+        # Calculate Qx, Qy positions at given radius for each angle
+        qx_circle = radius * np.cos(theta)
+        qy_circle = radius * np.sin(theta)
+
+        # Create vertex grid: n_qz x n_theta vertices
+        vertices = []
+        values = []
+
+        for iz, qz_val in enumerate(qz):
+            for _i_theta, (qx_val, qy_val) in enumerate(
+                zip(qx_circle, qy_circle, strict=True)
+            ):
+                # Find nearest grid indices for Qx, Qy
+                ix = np.argmin(np.abs(qx - qx_val))
+                iy = np.argmin(np.abs(qy - qy_val))
+
+                # Get intensity at this position (data is in ZYX order)
+                intensity = float(data[iz, iy, ix])
+
+                # Vertex coordinates in napari ZYX order
+                vertices.append([qz_val, qy_val, qx_val])
+                values.append(intensity)
+
+        vertices = np.array(vertices)
+        values = np.array(values)
+
+        # Create triangular faces connecting the vertices
+        # For a cylinder: connect each quad (iz, i_theta) with two triangles
+        faces = []
+        for iz in range(n_qz - 1):
+            for i_theta in range(n_theta - 1):
+                # Vertex indices for the quad
+                v00 = iz * n_theta + i_theta
+                v01 = iz * n_theta + (i_theta + 1)
+                v10 = (iz + 1) * n_theta + i_theta
+                v11 = (iz + 1) * n_theta + (i_theta + 1)
+
+                # Two triangles per quad
+                faces.append([v00, v01, v11])
+                faces.append([v00, v11, v10])
+
+        faces = np.array(faces)
+
+        if len(vertices) == 0:
+            return None, None, None
+
+        return vertices, faces, values
+
+    def _remove_cylinder_layer(self) -> None:
+        """Remove cylindrical surface layer."""
+        layer = self._state.get("cylinder_layer")
+        if layer is not None and self.viewer is not None:
+            with contextlib.suppress(ValueError, KeyError):
+                self.viewer.layers.remove(layer)
+            self._state["cylinder_layer"] = None
+
+    def _on_sphere_visibility_changed(self):
+        """Handler for sphere visibility checkbox."""
+        if self.sphere_visible.value:
+            self._update_sphere_surface()
+        else:
+            self._remove_sphere_layer()
+
+    def _on_sphere_params_changed(self):
+        """Handler for sphere parameter changes."""
+        if self.sphere_visible.value:
+            self._update_sphere_surface()
+
+    def _update_sphere_surface(self):
+        """Extract and display spherical surface in Q-space."""
+        viz = self._state.get("rsm_viz")
+        if viz is None:
+            return
+
+        # Check if we're in Q space
+        if viz.space != "q":
+            show_warning("Spherical surface is only available in Q space")
+            self.sphere_visible.value = False
+            return
+
+        # Get parameters
+        radius = float(self.sphere_radius_w.value)
+        n_samples = int(self.sphere_samples_w.value)
+        opacity = float(self.sphere_opacity_w.value)
+        colormap = str(self.sphere_cmap_w.value)
+
+        # Extract mesh
+        vertices, faces, values = self._extract_spherical_surface_mesh(
+            viz, radius, n_samples
+        )
+
+        if vertices is None:
+            show_error("Failed to extract spherical surface.")
+            self.sphere_visible.value = False
+            return
+
+        # Remove old layer
+        self._remove_sphere_layer()
+
+        # Add new surface layer
+        if self.viewer is not None:
+            layer = self.viewer.add_surface(
+                (vertices, faces, values),
+                name="Sphere Surface",
+                colormap=colormap,
+                opacity=opacity,
+                shading="smooth",
+            )
+            self._state["sphere_layer"] = layer
+
+    def _extract_spherical_surface_mesh(
+        self, viz, radius: float, n_samples: int
+    ) -> tuple:
+        """
+        Extract spherical surface mesh at given radius from Q-space origin.
+
+        Returns (vertices, faces, values) where:
+        - vertices: Nx3 array of (Qz, Qy, Qx) coordinates
+        - faces: Mx3 array of triangle vertex indices
+        - values: N array of intensity values at each vertex
+        """
+        try:
+            # Get grid and axes
+            qx = viz.xax
+            qy = viz.yax
+            qz = viz.zax
+
+            # Extract data using log view if enabled
+            data = viz._log1p_clip(viz.volume) if viz.log_view else viz.volume
+
+            # Generate spherical sampling
+            # Phi: polar angle from +Qz axis (0 to π)
+            # Theta: azimuthal angle around Qz axis (0 to 2π)
+            n_phi = n_samples
+            n_theta = n_samples * 2  # More samples in azimuthal direction
+
+            phi = np.linspace(0, np.pi, n_phi)
+            theta = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
+
+            # Create vertices and sample data
+            vertices = []
+            values = []
+
+            for _i_phi, phi_val in enumerate(phi):
+                for _i_theta, theta_val in enumerate(theta):
+                    # Convert spherical to Cartesian coordinates
+                    # Qx = r * sin(phi) * cos(theta)
+                    # Qy = r * sin(phi) * sin(theta)
+                    # Qz = r * cos(phi)
+                    qx_val = radius * np.sin(phi_val) * np.cos(theta_val)
+                    qy_val = radius * np.sin(phi_val) * np.sin(theta_val)
+                    qz_val = radius * np.cos(phi_val)
+
+                    # Find nearest grid indices
+                    ix = np.argmin(np.abs(qx - qx_val))
+                    iy = np.argmin(np.abs(qy - qy_val))
+                    iz = np.argmin(np.abs(qz - qz_val))
+
+                    # Get intensity at this position (data is in ZYX order)
+                    intensity = float(data[iz, iy, ix])
+
+                    # Vertex coordinates in napari ZYX order
+                    vertices.append([qz_val, qy_val, qx_val])
+                    values.append(intensity)
+
+            vertices = np.array(vertices)
+            values = np.array(values)
+
+            # Create triangular faces connecting the vertices
+            faces = []
+            for i_phi in range(n_phi - 1):
+                for i_theta in range(n_theta):
+                    i_theta_next = (i_theta + 1) % n_theta
+
+                    # Current quad vertices
+                    v0 = i_phi * n_theta + i_theta
+                    v1 = i_phi * n_theta + i_theta_next
+                    v2 = (i_phi + 1) * n_theta + i_theta_next
+                    v3 = (i_phi + 1) * n_theta + i_theta
+
+                    # Split quad into two triangles
+                    faces.append([v0, v1, v2])
+                    faces.append([v0, v2, v3])
+
+            faces = np.array(faces)
+
+            return vertices, faces, values
+
+        except (ValueError, IndexError, KeyError) as e:
+            print(f"Error extracting spherical surface: {e}")
+            return None, None, None
+
+    def _remove_sphere_layer(self):
+        """Remove the sphere surface layer from the viewer."""
+        layer = self._state.get("sphere_layer")
+        if layer is not None and self.viewer is not None:
+            with contextlib.suppress(ValueError, KeyError):
+                self.viewer.layers.remove(layer)
+            self._state["sphere_layer"] = None
 
     def on_export_vtk(self) -> None:
         if self._state.get("grid") is None or self._state.get("edges") is None:
@@ -2005,59 +2883,83 @@ class ResviewDockWidget(QtWidgets.QWidget):
         finally:
             self.set_busy(False)
 
-    # -------------------------------------------------------------------------
-    # Run All pipeline (async-safe)
-    # -------------------------------------------------------------------------
-    def on_run_all(self) -> None:
-        self.btn_run_all_native.setEnabled(False)
-        self._run_all_pending = True
-        self.set_progress(0, busy=False)
-        self.status("Run All: starting Load…")
-        self.on_load()
+    def on_export_grid(self) -> None:
+        """Export the 3D grid array as a TIFF file."""
+        if self._state.get("grid") is None:
+            show_error("Regrid first, then export.")
+            return
 
-    def _run_all_build(self) -> None:
+        out_path = as_path_str(self.export_grid_w.value).strip()
+        if not out_path:
+            show_error("Choose an output grid file path (.tiff).")
+            return
+        if not out_path.lower().endswith((".tif", ".tiff")):
+            out_path += ".tiff"
+
+        self.set_busy(True)
+        self.set_progress(None, busy=True)
+        self.status(f"Exporting grid → {out_path}")
+
         try:
-            self.on_build()
-        except (RuntimeError, ValueError, TypeError) as e:
-            show_error(f"Run All failed during Build: {e}")
-            self._run_all_pending = False
-            self.btn_run_all_native.setEnabled(True)
-            return
-
-        if self._state.get("builder") is None:
-            self._run_all_pending = False
-            self.btn_run_all_native.setEnabled(True)
-            return
-
-        self.status("Run All: starting Regrid…")
-        QtCore.QTimer.singleShot(0, self._run_all_regrid)
-
-    def _run_all_regrid(self) -> None:
-        try:
-            self.on_regrid()
-        except (RuntimeError, ValueError, TypeError) as e:
-            show_error(f"Run All failed during Regrid: {e}")
-            self._run_all_pending = False
-            self.btn_run_all_native.setEnabled(True)
-            return
-
-        if self._state.get("grid") is None or self._state.get("edges") is None:
-            self._run_all_pending = False
-            self.btn_run_all_native.setEnabled(True)
-            return
-
-        self.status("Run All: starting View…")
-        QtCore.QTimer.singleShot(0, self._run_all_view)
-
-    def _run_all_view(self) -> None:
-        try:
-            self.on_view()
-            self.status("Run All completed.")
-        except (RuntimeError, ValueError, TypeError) as e:
-            show_error(f"Run All failed during View: {e}")
+            grid_data = self._state["grid"]
+            # Ensure data is in a TIFF-compatible format
+            # TIFF supports uint8, uint16, float32, etc.
+            tifffile.imwrite(out_path, grid_data, compression="zlib")
+            self.set_progress(100, busy=False)
+            self.status(f"Exported grid: {out_path}")
+            show_info(f"Exported grid: {out_path}")
+        except (OSError, RuntimeError, ValueError, TypeError) as e:
+            show_error(f"Export grid error: {e}")
+            self.set_progress(0, busy=False)
+            self.status(f"Export grid failed: {e}")
         finally:
-            self._run_all_pending = False
-            self.btn_run_all_native.setEnabled(True)
+            self.set_busy(False)
+
+    def on_export_edges(self) -> None:
+        """Export both grid and coordinate arrays (grid + Qx/Qy/Qz or H/K/L) as a single .npz file."""
+        if self._state.get("grid") is None or self._state.get("edges") is None:
+            show_error("Regrid first, then export.")
+            return
+
+        out_path = as_path_str(self.export_edges_w.value).strip()
+        if not out_path:
+            show_error("Choose an output file path (.npz).")
+            return
+        if not out_path.lower().endswith(".npz"):
+            out_path += ".npz"
+
+        self.set_busy(True)
+        self.set_progress(None, busy=True)
+        self.status(f"Exporting grid+edges → {out_path}")
+
+        try:
+            # Get the current space setting to determine axis names
+            space = str(self.space_w.value or "hkl").lower()
+            xaxis, yaxis, zaxis = self._state["edges"]
+            grid_data = self._state["grid"]
+
+            if space == "q":
+                # Q space: grid + Qx, Qy, Qz
+                np.savez_compressed(
+                    out_path, grid=grid_data, Qx=xaxis, Qy=yaxis, Qz=zaxis
+                )
+                self.status(f"Exported grid+edges (Qx, Qy, Qz): {out_path}")
+                show_info(f"Exported grid+edges (Qx, Qy, Qz): {out_path}")
+            else:
+                # HKL space: grid + H, K, L
+                np.savez_compressed(
+                    out_path, grid=grid_data, H=xaxis, K=yaxis, L=zaxis
+                )
+                self.status(f"Exported grid+edges (H, K, L): {out_path}")
+                show_info(f"Exported grid+edges (H, K, L): {out_path}")
+
+            self.set_progress(100, busy=False)
+        except (OSError, RuntimeError, ValueError, TypeError) as e:
+            show_error(f"Export error: {e}")
+            self.set_progress(0, busy=False)
+            self.status(f"Export failed: {e}")
+        finally:
+            self.set_busy(False)
 
 
 # -----------------------------------------------------------------------------

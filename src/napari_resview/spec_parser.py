@@ -307,15 +307,9 @@ class ScanAngles:
                     parts = line.split()
                     cur_scan = int(parts[1])
                     cur_type = parts[2] if len(parts) > 2 else ""
-                    # Skip ascans only when no explicit scan selection is
-                    # provided. If `selected_scans` is set, include scans
-                    # that match the selection regardless of their type.
+                    # Skip scans not in selection if selected_scans is provided
                     skip_current = False
-                    if self._selected_scans is None:
-                        # No selection: preserve historical behavior and
-                        # ignore ascans.
-                        skip_current = cur_type.lower() == "ascan"
-                    else:
+                    if self._selected_scans is not None:
                         # Selection provided: skip scans not in the set.
                         skip_current = cur_scan not in self._selected_scans
                     p0_map.clear()

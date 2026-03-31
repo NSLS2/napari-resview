@@ -207,6 +207,347 @@ class RSMNapariViewer:
             self.img_layer.translate = self.translate
             self._force_volume(self.img_layer)
 
+    def add_slices(
+        self,
+        axis: str,
+        positions: Union[float, Sequence[float]],
+        *,
+        use_index: bool = False,
+        opacity: float = 0.8,
+        colormap: str = "turbo",
+        name_prefix: str = "slice",
+        blending: str = "translucent",
+        add_border: bool = False,
+    ) -> list:
+        """
+        Add 2D slice planes through the 3D volume.
+
+        Parameters
+        ----------
+        axis : str
+            Slicing axis: 'x', 'y', or 'z' (or 'h', 'k', 'l' for HKL space).
+        positions : float or sequence of float
+            Position(s) along the axis to extract slices. By default, these are
+            coordinate values (H/K/L or Qx/Qy/Qz). Set `use_index=True` to
+            specify voxel indices instead.
+        use_index : bool, optional
+            If True, `positions` are interpreted as integer voxel indices.
+            If False (default), they are coordinate values and the nearest voxel
+            is selected.
+        opacity : float, optional
+            Opacity of the slice layers (0.0=transparent, 1.0=opaque).
+        colormap : str, optional
+            Napari colormap name for the slices.
+        name_prefix : str, optional
+            Prefix for slice layer names. Each slice will be named
+            "{name_prefix}_{axis}_{value}".
+        blending : str, optional
+            Blending mode for slice layers ('translucent', 'additive', etc.).
+        add_border : bool, optional
+            If True, add red border pixels around the edge of each slice.
+
+        Returns
+        -------
+        list
+            List of added napari Image layers.
+        """
+        self._require_viewer()
+        axis = axis.lower()
+
+        # Map HKL names to XYZ
+        axis_map = {"h": "x", "k": "y", "l": "z"}
+        axis = axis_map.get(axis, axis)
+
+        if axis not in {"x", "y", "z"}:
+            raise ValueError("axis must be 'x', 'y', 'z', 'h', 'k', or 'l'")
+
+        # Ensure positions is a sequence
+        if isinstance(positions, (int, float)):
+            positions = [positions]
+        positions = list(positions)
+
+        # Select axis and shape info
+        if axis == "x":
+            ax_array = self.xax
+            ax_dim = 0  # grid dimension
+            ax_label = "H" if self.space == "hkl" else "Qx"
+        elif axis == "y":
+            ax_array = self.yax
+            ax_dim = 1
+            ax_label = "K" if self.space == "hkl" else "Qy"
+        else:  # z
+            ax_array = self.zax
+            ax_dim = 2
+            ax_label = "L" if self.space == "hkl" else "Qz"
+
+        # Convert positions to indices if needed
+        if use_index:
+            indices = [int(p) for p in positions]
+        else:
+            indices = [
+                int(np.argmin(np.abs(ax_array - pos))) for pos in positions
+            ]
+
+        # Validate indices
+        max_idx = self.grid.shape[ax_dim] - 1
+        indices = [idx for idx in indices if 0 <= idx <= max_idx]
+        if not indices:
+            logger.warning("No valid slice positions found")
+            return []
+
+        # Extract slices and add to viewer
+        layers = []
+        data = self._log1p_clip(self.volume) if self.log_view else self.volume
+
+        for idx in indices:
+            # Extract 2D slice from 3D volume (ZYX ordering) and reshape to 3D
+            # with singleton dimension to properly position in 3D space
+            coord_value = float(ax_array[idx])
+
+            if axis == "x":
+                # X corresponds to last dimension in volume
+                slice_2d = data[:, :, idx]  # (Z, Y)
+                # Reshape to (Z, Y, 1) for 3D positioning
+                slice_3d = slice_2d[:, :, np.newaxis]
+                # Full 3D scale and translate, with X position at coord_value
+                scale_3d = self.scale  # (dz, dy, dx)
+                translate_3d = (
+                    self.translate[0],
+                    self.translate[1],
+                    coord_value,
+                )
+            elif axis == "y":
+                # Y corresponds to middle dimension
+                slice_2d = data[:, idx, :]  # (Z, X)
+                # Reshape to (Z, 1, X) for 3D positioning
+                slice_3d = slice_2d[:, np.newaxis, :]
+                # Full 3D scale and translate, with Y position at coord_value
+                scale_3d = self.scale  # (dz, dy, dx)
+                translate_3d = (
+                    self.translate[0],
+                    coord_value,
+                    self.translate[2],
+                )
+            else:  # z
+                # Z corresponds to first dimension
+                slice_2d = data[idx, :, :]  # (Y, X)
+                # Reshape to (1, Y, X) for 3D positioning
+                slice_3d = slice_2d[np.newaxis, :, :]
+                # Full 3D scale and translate, with Z position at coord_value
+                scale_3d = self.scale  # (dz, dy, dx)
+                translate_3d = (
+                    coord_value,
+                    self.translate[1],
+                    self.translate[2],
+                )
+
+            # Add red border to slice if requested
+            if add_border:
+                slice_3d = self._add_red_border_to_slice(slice_3d)
+
+            layer_name = f"{name_prefix}_{ax_label}_{coord_value:.3f}"
+
+            # Compute percentile-based contrast limits
+            lo, hi = self._robust_percentiles(
+                slice_2d, self.contrast_percentiles
+            )
+
+            layer = self.viewer.add_image(
+                slice_3d,
+                name=layer_name,
+                colormap=colormap,
+                scale=scale_3d,
+                translate=translate_3d,
+                opacity=opacity,
+                blending=blending,
+                contrast_limits=(float(lo), float(hi)),
+            )
+            layers.append(layer)
+            logger.info(
+                "Added slice at %s=%.3f (index %d)", ax_label, coord_value, idx
+            )
+
+        return layers
+
+    def _add_red_border_to_slice(
+        self, slice_3d: np.ndarray, border_width: int = 1
+    ) -> np.ndarray:
+        """Add red border pixels to a slice array.
+
+        Parameters
+        ----------
+        slice_3d : ndarray
+            3D slice array (can have singleton dimension)
+        border_width : int
+            Width of the border in pixels
+
+        Returns
+        -------
+        ndarray
+            Modified slice with red border (uses max value from slice)
+        """
+        # Get the max value from the slice to use for the border
+        max_val = np.nanmax(slice_3d)
+        if not np.isfinite(max_val):
+            max_val = 1.0
+
+        # Multiply by a factor to make border brighter/more visible
+        border_val = max_val * 2.0
+
+        # Create a copy to modify
+        result = slice_3d.copy()
+
+        # Find the non-singleton dimensions
+        shape = result.shape
+
+        # Apply border to the first two non-singleton dimensions
+        # Handle different slice orientations
+        if shape[0] > 1 and shape[1] > 1:  # Z-Y plane or Y-X plane
+            # Top and bottom edges
+            result[:border_width, :, ...] = border_val
+            result[-border_width:, :, ...] = border_val
+            # Left and right edges
+            result[:, :border_width, ...] = border_val
+            result[:, -border_width:, ...] = border_val
+        elif shape[0] > 1 and shape[2] > 1:  # Z-X plane
+            # Top and bottom edges
+            result[:border_width, :, :] = border_val
+            result[-border_width:, :, :] = border_val
+            # Left and right edges
+            result[:, :, :border_width] = border_val
+            result[:, :, -border_width:] = border_val
+        elif shape[1] > 1 and shape[2] > 1:  # Y-X plane
+            # Top and bottom edges
+            result[:, :border_width, :] = border_val
+            result[:, -border_width:, :] = border_val
+            # Left and right edges
+            result[:, :, :border_width] = border_val
+            result[:, :, -border_width:] = border_val
+
+        return result
+
+    def extract_subvolume(
+        self,
+        x_range: Tuple[float, float] | None = None,
+        y_range: Tuple[float, float] | None = None,
+        z_range: Tuple[float, float] | None = None,
+        *,
+        use_index: bool = False,
+        add_to_viewer: bool = True,
+        name: str = "subvolume",
+        **layer_kwargs,
+    ) -> dict:
+        """
+        Extract a 3D sub-volume within specified coordinate ranges.
+
+        Parameters
+        ----------
+        x_range : tuple of (float, float) or None
+            (min, max) range along X axis (H or Qx). None = full range.
+        y_range : tuple of (float, float) or None
+            (min, max) range along Y axis (K or Qy). None = full range.
+        z_range : tuple of (float, float) or None
+            (min, max) range along Z axis (L or Qz). None = full range.
+        use_index : bool, optional
+            If True, ranges are voxel indices. If False (default), coordinate values.
+        add_to_viewer : bool, optional
+            If True (default), add the sub-volume as a new layer to the viewer.
+        name : str, optional
+            Name for the new layer if `add_to_viewer=True`.
+        **layer_kwargs
+            Additional keyword arguments passed to viewer.add_image().
+
+        Returns
+        -------
+        dict
+            Dictionary with keys:
+            - 'grid': 3D numpy array (cropped grid data)
+            - 'axes': tuple of (xax, yax, zax) arrays (cropped axes)
+            - 'layer': napari Image layer (if added to viewer, else None)
+        """
+
+        # Determine index ranges for each axis
+        def get_indices(ax_array, range_spec):
+            if range_spec is None:
+                return 0, len(ax_array) - 1
+            rmin, rmax = range_spec
+            if use_index:
+                imin, imax = int(rmin), int(rmax)
+            else:
+                imin = int(np.argmin(np.abs(ax_array - rmin)))
+                imax = int(np.argmin(np.abs(ax_array - rmax)))
+            imin = max(0, min(imin, imax))
+            imax = min(len(ax_array) - 1, max(imin, imax))
+            return imin, imax
+
+        x_min, x_max = get_indices(self.xax, x_range)
+        y_min, y_max = get_indices(self.yax, y_range)
+        z_min, z_max = get_indices(self.zax, z_range)
+
+        # Extract sub-grid and sub-axes
+        sub_grid = self.grid[
+            x_min : x_max + 1, y_min : y_max + 1, z_min : z_max + 1
+        ]
+        sub_xax = self.xax[x_min : x_max + 1].copy()
+        sub_yax = self.yax[y_min : y_max + 1].copy()
+        sub_zax = self.zax[z_min : z_max + 1].copy()
+
+        result = {
+            "grid": sub_grid,
+            "axes": (sub_xax, sub_yax, sub_zax),
+            "layer": None,
+        }
+
+        if add_to_viewer:
+            self._require_viewer()
+            # Compute volume representation
+            sub_volume, sub_scale, sub_translate, _ = (
+                self._volume_from_grid_axes(
+                    sub_grid, (sub_xax, sub_yax, sub_zax)
+                )
+            )
+            data = (
+                self._log1p_clip(sub_volume) if self.log_view else sub_volume
+            )
+            lo, hi = self._robust_percentiles(data, self.contrast_percentiles)
+
+            # Merge user kwargs with defaults
+            kwargs = {
+                "colormap": self.cmap,
+                "opacity": 0.9,
+                "blending": "translucent",
+                "contrast_limits": (float(lo), float(hi)),
+            }
+            kwargs.update(layer_kwargs)
+
+            layer = self.viewer.add_image(
+                data,
+                name=name,
+                scale=sub_scale,
+                translate=sub_translate,
+                **kwargs,
+            )
+            self._force_volume(layer)
+            result["layer"] = layer
+
+            x_label = "H" if self.space == "hkl" else "Qx"
+            y_label = "K" if self.space == "hkl" else "Qy"
+            z_label = "L" if self.space == "hkl" else "Qz"
+            logger.info(
+                "Extracted subvolume: %s=[%.3f, %.3f], %s=[%.3f, %.3f], %s=[%.3f, %.3f]",
+                x_label,
+                sub_xax[0],
+                sub_xax[-1],
+                y_label,
+                sub_yax[0],
+                sub_yax[-1],
+                z_label,
+                sub_zax[0],
+                sub_zax[-1],
+            )
+
+        return result
+
     # ------------------------------ overlays ----------------------------------
     def _add_outline_and_corners(self, v: napari.Viewer) -> None:
         zmin, zmax = float(self.zax[0]), float(self.zax[-1])

@@ -50,7 +50,9 @@ class RSMDataLoader_ISR:
 
     def load(self):
         setup = ExperimentSetup.from_yaml(self.setup_file)
-        exp = SpecParser(self.spec_file, self.setup_file)
+        exp = SpecParser(
+            self.spec_file, self.setup_file, selected_scans=self.selected_scans
+        )
         df_meta = exp.to_pandas()
         df_meta["scan_number"] = df_meta["scan_number"].astype(int)
         df_meta["data_number"] = df_meta["data_number"].astype(int)

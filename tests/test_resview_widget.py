@@ -14,7 +14,7 @@ def test_resview_dockwidget_constructs_and_has_tabs(
     """
     Ensures ResviewDockWidget can be constructed both with an explicit viewer
     and with viewer=None (using napari.current_viewer fallback), and that the
-    3 vertical tabs exist with expected labels.
+    4 vertical tabs exist with expected labels.
 
     Requires napari's pytest fixture: make_napari_viewer
     (from napari plugin testing helpers).
@@ -26,14 +26,15 @@ def test_resview_dockwidget_constructs_and_has_tabs(
     assert w1.viewer is viewer
     assert isinstance(w1, QtWidgets.QWidget)
 
-    # Tab widget exists and has 3 tabs labeled Data / Build / View
+    # Tab widget exists and has 4 tabs labeled Data / Build / View / Analysis
     tabs = w1.findChild(QtWidgets.QTabWidget)
     assert tabs is not None, "Expected a QTabWidget in the dock widget"
-    assert tabs.count() == 3
+    assert tabs.count() == 4
     assert [tabs.tabText(i) for i in range(tabs.count())] == [
         "Data",
         "Build",
         "View",
+        "Analysis",
     ]
 
     # Sanity-check one widget on the Data tab

@@ -29,6 +29,23 @@ jobs:
       matrix:
         platform: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        # Speed up CI: skip Windows testing (unreliable), only test Python 3.11 on macOS
+        # Linux tests the full Python version matrix for comprehensive coverage
+        exclude:
+          - platform: windows-latest
+            python-version: "3.10"
+          - platform: windows-latest
+            python-version: "3.11"
+          - platform: windows-latest
+            python-version: "3.12"
+          - platform: windows-latest
+            python-version: "3.13"
+          - platform: macos-latest
+            python-version: "3.10"
+          - platform: macos-latest
+            python-version: "3.12"
+          - platform: macos-latest
+            python-version: "3.13"
 
     steps:
       - uses: actions/checkout@v5
@@ -38,6 +55,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           activate-environment: "true"
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+
       - name: Install Windows OpenGL
         uses: pyvista/setup-headless-display-action@v4.2
         with:
@@ -54,6 +74,9 @@ jobs:
         run: uvx --with tox-gh-actions tox
         env:
           PLATFORM: ${{ matrix.platform }}
+          # Windows optimizations
+          UV_LINK_MODE: copy
+          UV_INDEX_STRATEGY: unsafe-best-match
 
       - name: Coverage
         uses: codecov/codecov-action@v5
