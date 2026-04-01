@@ -32,7 +32,7 @@ dependencies = [
     "numpy",
     "magicgui>=0.10.1",
     "qtpy>=2.4.3",
-    "xrayutilities==1.7.10",
+    "xrayutilities==1.7.12",
     "h5py",
     "hdf5plugin",
     "pyyaml>=6.0.3",
