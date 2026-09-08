@@ -3,27 +3,27 @@ profiles:
   ISR:
     data:
       loader_type: ISR
-      data_file: /Users/xiaogangyang/data/isr_rsm3d/Oct_22_2025/tiff
-      scans: '64'
-      spec_file: /Users/xiaogangyang/data/isr_rsm3d/FeTe_GeTe_101525
+      data_file: /nsls2/users/xyang4/data/data_cs/isr_rsm3d_09082026/mn4fege3.1
+      scans: '46'
+      spec_file: /nsls2/users/xyang4/data/data_cs/isr_rsm3d_09082026/mn4ege3.1_spec
       only_hkl: false
       cms_crop: null
       cms_angle_step: 1.0
     ExperimentSetup:
       distance: 0.78105
-      pitch: 7.5e-05
-      ycenter: 257
-      xcenter: 515
-      xpixels: 1030
-      ypixels: 514
+      pitch: 7.4994e-05
+      ycenter: 170
+      xcenter: 297
+      xpixels: 457
+      ypixels: 386
       energy: 11.566
       wavelength: 1.072
     Crystal:
-      ub: '-0.122354 1.6432 0.0160271
+      ub: '-0.0469924 0.874435 -0.355842
 
-        -1.64319 -0.122757 0.0153525
+        -1.07778 -0.559566 0.0999303
 
-        0.0270981 -0.0243702 1.00332'
+        0.0750554 0.302824 1.21219'
     build:
       ub_includes_2pi: true
       center_is_one_based: false
@@ -32,9 +32,9 @@ profiles:
     crop:
       enable: true
       y_min: 0
-      y_max: 384
+      y_max: 386
       x_min: 0
-      x_max: 514
+      x_max: 457
     regrid:
       space: hkl
       grid_shape: 200,*,*
