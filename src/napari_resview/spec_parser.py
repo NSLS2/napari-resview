@@ -6,6 +6,7 @@ Defines ExperimentSetup, Crystal, ScanAngles, and SpecParser classes to parse
 SPEC-format files and return scan data as a pandas or Dask DataFrame.
 """
 
+import warnings
 from pathlib import Path
 
 import dask.dataframe as dd
@@ -249,14 +250,40 @@ class Crystal:
 
 
 class ScanAngles:
-    ASCAN_AXES = ("VTTH", "VTH", "Phi", "Chi")
-    HKL_AXES = ("VTTH", "VTH", "Chi", "Phi")
+    # Logical goniometer/reciprocal axes mapped to the many motor/column names
+    # different SPEC configurations use. Matching is case-insensitive and order
+    # independent, so a scan header may list these in any order under any of the
+    # accepted aliases. Extend/override via the ``axis_aliases`` constructor arg.
+    DEFAULT_AXIS_ALIASES = {
+        "tth": (
+            "vtth", "tth", "twotheta", "two_theta", "2theta", "ttheta",
+            "del", "delta", "detth", "det_tth",
+        ),
+        "th": (
+            "vth", "th", "theta", "eta", "omega", "om", "samth", "sth",
+        ),
+        "chi": ("chi", "vchi", "schi"),
+        "phi": ("phi", "vphi", "sphi"),
+        "h": ("h",),
+        "k": ("k",),
+        "l": ("l",),
+    }
+    # Logical angles that end up as goniometer columns in the output records.
+    ANGLE_KEYS = ("tth", "th", "chi", "phi")
 
     # Modified __init__ to also accept a Crystal object (if needed later)
-    def __init__(self, filename, crystal, npartitions=1, selected_scans=None):
+    def __init__(
+        self,
+        filename,
+        crystal,
+        npartitions=1,
+        selected_scans=None,
+        axis_aliases=None,
+    ):
         self.filename = filename
         self.npartitions = npartitions
         self.crystal = crystal  # store the Crystal object
+        self._alias_map = self._build_alias_map(axis_aliases)
         # Normalize selected_scans to a set of ints for fast membership tests
         if selected_scans is None:
             self._selected_scans = None
@@ -269,6 +296,48 @@ class ScanAngles:
             except (TypeError, ValueError):
                 self._selected_scans = {int(selected_scans)}
 
+    @classmethod
+    def _build_alias_map(cls, axis_aliases=None):
+        """Build a reverse map {normalized_name: logical_axis}."""
+        aliases = dict(cls.DEFAULT_AXIS_ALIASES)
+        if axis_aliases:
+            for logical, names in axis_aliases.items():
+                if isinstance(names, str):
+                    names = (names,)
+                aliases[logical] = tuple(names)
+        rev = {}
+        for logical, names in aliases.items():
+            for name in names:
+                rev[str(name).strip().lower()] = logical
+        return rev
+
+    def _resolve(self, name):
+        """Return the logical axis for a motor/column name, or None."""
+        if name is None:
+            return None
+        return self._alias_map.get(str(name).strip().lower())
+
+    def _find_col_for_logical(self, cols, logical):
+        for i, c in enumerate(cols):
+            if self._resolve(c) == logical:
+                return i
+        return None
+
+    def _find_scan_col(self, cols, scan_motor):
+        """Locate the scanned-motor column in an ascan #L header."""
+        if scan_motor:
+            target = str(scan_motor).strip().lower()
+            for i, c in enumerate(cols):
+                if str(c).strip().lower() == target:
+                    return i
+            logical = self._resolve(scan_motor)
+            if logical is not None:
+                idx = self._find_col_for_logical(cols, logical)
+                if idx is not None:
+                    return idx
+        # In SPEC the scanned motor is conventionally the first data column.
+        return 0 if cols else None
+
     def parse_all_scans(self):
         """
         Read the SPEC file and return a list of dicts with scan data.
@@ -279,23 +348,28 @@ class ScanAngles:
           - tth, th, chi, phi: goniometer angles
           - h, k, l: reciprocal-lattice coordinates
           - ub: 3×3 UB matrix read from the "#G3" line within that scan (if present), otherwise None.
+
+        Motor and column names are matched case-insensitively through the axis
+        alias table, so SPEC files that use different names/orderings for the
+        goniometer angles are handled without failing on "unknown" keywords.
         """
-        # Read global #O0 ordering from the SPEC file.
-        o0_names = []
-        with open(self.filename) as f:
-            for line in f:
-                if line.startswith("#O0 "):
-                    o0_names = line[4:].split()
-                    break
-        if not o0_names:
-            raise RuntimeError("Missing global #O0 line in SPEC file")
+        # Collect every global "#O<n>" motor-name group so fixed-motor positions
+        # from any "#P<n>" line can be resolved, regardless of grouping.
+        o_groups = self._read_motor_name_groups()
+        if not o_groups:
+            warnings.warn(
+                "SPEC file has no '#O' motor-name lines; fixed-motor angles "
+                "for point scans may be unavailable.",
+                stacklevel=2,
+            )
 
         results = []
         cur_scan = None
         cur_type = None
-        skip_current = False  # ignore 'ascan' scans or scans not requested
-        p0_map = {}
-        data_idx = {}
+        scan_motor = None  # scanned motor name from the "#S" command (ascan)
+        skip_current = False  # scans not requested via selected_scans
+        motor_pos = {}  # raw {motor_name: value} from "#P<n>" lines
+        ctx = {}  # per-scan data-block parsing context
         in_data = False
         counter = 0
         current_ub = None  # per-scan UB
@@ -307,25 +381,24 @@ class ScanAngles:
                     parts = line.split()
                     cur_scan = int(parts[1])
                     cur_type = parts[2] if len(parts) > 2 else ""
-                    # Skip scans not in selection if selected_scans is provided
-                    skip_current = False
-                    if self._selected_scans is not None:
-                        # Selection provided: skip scans not in the set.
-                        skip_current = cur_scan not in self._selected_scans
-                    p0_map.clear()
-                    data_idx.clear()
+                    # For point scans the scanned motor is the first command arg.
+                    scan_motor = parts[3] if len(parts) > 3 else None
+                    skip_current = (
+                        self._selected_scans is not None
+                        and cur_scan not in self._selected_scans
+                    )
+                    motor_pos = {}
+                    ctx = {}
                     in_data = False
                     counter = 0
                     current_ub = None
                     continue
 
-                # Skip all lines for scans we don't want (ascans or not-selected)
-                if skip_current:
+                if skip_current or cur_scan is None:
                     continue
 
                 # Look for UB update within a scan: "#G3" line.
-                if cur_scan is not None and line.startswith("#G3 "):
-                    # Parse UB: assume nine numbers follow "#G3"
+                if line.startswith("#G3 "):
                     ub_vals = [float(x) for x in line.split()[1:]]
                     if len(ub_vals) != 9:
                         raise RuntimeError(
@@ -334,136 +407,155 @@ class ScanAngles:
                     current_ub = np.array(ub_vals).reshape((3, 3))
                     continue
 
-                # Grab fixed motors from "#P0" line (for ascan).
-                if cur_scan is not None and line.startswith("#P0 "):
-                    vals = [float(x) for x in line.split()[1:]]
-                    p0_map = {name: vals[i] for i, name in enumerate(o0_names)}
+                # Fixed motor positions from any "#P<n>" line.
+                if line.startswith("#P") and len(line) > 2 and line[2].isdigit():
+                    head = line.split()
+                    idx = head[0][2:]
+                    names = o_groups.get(int(idx), []) if idx.isdigit() else []
+                    for i, val in enumerate(head[1:]):
+                        if i < len(names):
+                            try:
+                                motor_pos[names[i]] = float(val)
+                            except ValueError:
+                                continue
                     continue
 
-                # Data header (#L): parse either hklscan or ascan
-                if cur_scan is not None and line.startswith("#L "):
+                # Data header (#L): build the parsing context for this scan.
+                if line.startswith("#L "):
                     cols = line.split()[1:]
                     ctype = (
                         cur_type.lower() if isinstance(cur_type, str) else ""
                     )
-                    if ctype == "ascan":
-                        # Find which axis column corresponds to the scan axis
-                        axes = [c for c in self.ASCAN_AXES if c in cols]
-                        if len(axes) != 1:
-                            raise RuntimeError(
-                                f"Scan {cur_scan} (ascan): expected one of {self.ASCAN_AXES} in header"
-                            )
-                        scan_col = axes[0]
-                        data_idx["scan_col"] = cols.index(scan_col)
-                        # remember the scan column name alongside fixed motors
-                        p0_map["_scan_col_name"] = scan_col
-                        # also locate H/K/L positions if present
-                        for hk in ("H", "K", "L"):
-                            if hk in cols:
-                                data_idx[hk] = cols.index(hk)
-                        in_data = True
-                        continue
-                    if ctype == "hklscan":
-                        for ax in self.HKL_AXES:
-                            data_idx[ax] = cols.index(ax)
-                        for hk in ("H", "K", "L"):
-                            data_idx[hk] = cols.index(hk)
-                        in_data = True
-                        continue
-                    in_data = False
+                    ctx = self._build_data_context(
+                        ctype, cols, scan_motor, motor_pos
+                    )
+                    in_data = ctx.get("in_data", False)
                     continue
 
                 if in_data:
                     if not line or (
-                        line.startswith("#") and not line[1].isdigit()
+                        line.startswith("#")
+                        and not (len(line) > 1 and line[1].isdigit())
                     ):
                         in_data = False
                         continue
                     parts = line.split()
-                    # Only consider integer indices when checking column bounds
-                    try:
-                        max_idx = max(
-                            (
-                                v
-                                for v in data_idx.values()
-                                if isinstance(v, int)
-                            ),
-                            default=-1,
-                        )
-                    except (TypeError, ValueError):
-                        max_idx = -1
-                    if len(parts) < max_idx + 1:
+                    if len(parts) < ctx.get("max_idx", -1) + 1:
                         continue
-                    rec = {
-                        "scan_number": f"{cur_scan:03d}",
-                        "data_number": f"{counter:03d}",
-                        "type": cur_type,
-                        "ub": (
-                            current_ub.copy()
-                            if current_ub is not None
-                            else None
-                        ),
-                    }
-                    # parse depending on scan type
-                    ctype = (
-                        cur_type.lower() if isinstance(cur_type, str) else ""
+                    results.append(
+                        self._build_record(
+                            cur_scan, counter, cur_type, current_ub, ctx, parts
+                        )
                     )
-                    if ctype == "ascan":
-                        # start from fixed motors for ascan
-                        rec.update(
-                            {
-                                "tth": p0_map.get("VTTH"),
-                                "th": p0_map.get("VTH"),
-                                "chi": p0_map.get("Chi"),
-                                "phi": p0_map.get("Phi"),
-                                "h": (
-                                    float(parts[data_idx["H"]])
-                                    if "H" in data_idx
-                                    else None
-                                ),
-                                "k": (
-                                    float(parts[data_idx["K"]])
-                                    if "K" in data_idx
-                                    else None
-                                ),
-                                "l": (
-                                    float(parts[data_idx["L"]])
-                                    if "L" in data_idx
-                                    else None
-                                ),
-                            }
-                        )
-                        # update the motor value that was scanned
-                        try:
-                            scan_idx = data_idx["scan_col"]
-                            val = float(parts[scan_idx])
-                        except (IndexError, ValueError, TypeError):
-                            val = None
-                        scan_name = p0_map.get("_scan_col_name")
-                        if scan_name == "VTTH":
-                            rec["tth"] = val
-                        elif scan_name == "VTH":
-                            rec["th"] = val
-                        elif scan_name == "Phi":
-                            rec["phi"] = val
-                        elif scan_name == "Chi":
-                            rec["chi"] = val
-                    else:
-                        # hklscan parsing
-                        rec.update(
-                            {
-                                "tth": float(parts[data_idx["VTTH"]]),
-                                "th": float(parts[data_idx["VTH"]]),
-                                "chi": float(parts[data_idx["Chi"]]),
-                                "phi": float(parts[data_idx["Phi"]]),
-                                "h": float(parts[data_idx["H"]]),
-                                "k": float(parts[data_idx["K"]]),
-                                "l": float(parts[data_idx["L"]]),
-                            }
-                        )
-                    results.append(rec)
                     counter += 1
         return results
+
+    def _read_motor_name_groups(self):
+        """Return {group_index: [motor_names]} from the global '#O<n>' lines."""
+        o_groups = {}
+        with open(self.filename) as f:
+            for line in f:
+                if line.startswith("#O"):
+                    head = line.split(None, 1)
+                    idx = head[0][2:]
+                    if idx.isdigit():
+                        o_groups[int(idx)] = (
+                            head[1].split() if len(head) > 1 else []
+                        )
+                elif line.startswith("#S ") and o_groups:
+                    # Motor-name lines live in the header, before the first scan.
+                    break
+        return o_groups
+
+    def _build_data_context(self, ctype, cols, scan_motor, motor_pos):
+        """Resolve column/motor positions for a scan's data block."""
+        ctx = {"type": ctype, "in_data": False}
+
+        # H/K/L data columns (resolved case-insensitively).
+        hkl_idx = {}
+        for i, c in enumerate(cols):
+            logical = self._resolve(c)
+            if logical in ("h", "k", "l"):
+                hkl_idx.setdefault(logical, i)
+        ctx["hkl_idx"] = hkl_idx
+
+        if ctype == "hklscan":
+            angle_idx = {}
+            for key in self.ANGLE_KEYS:
+                idx = self._find_col_for_logical(cols, key)
+                if idx is not None:
+                    angle_idx[key] = idx
+            ctx["angle_idx"] = angle_idx
+            ctx["in_data"] = True
+        elif ctype:
+            # Step scans (ascan, a2scan/aNscan, dscan/dNscan, ...): fixed
+            # goniometer angles come from the motor positions, while any
+            # scanned angle present as a data column is read per row.
+            fixed = {k: None for k in self.ANGLE_KEYS}
+            for name, val in motor_pos.items():
+                logical = self._resolve(name)
+                if logical in fixed:
+                    fixed[logical] = val
+            ctx["fixed_angles"] = fixed
+            # Any angle present as a data column (covers multi-motor scans
+            # like a2scan) overrides its fixed motor value per row.
+            angle_idx = {}
+            for key in self.ANGLE_KEYS:
+                idx = self._find_col_for_logical(cols, key)
+                if idx is not None:
+                    angle_idx[key] = idx
+            ctx["angle_idx"] = angle_idx
+            # Fallback for a single scanned motor whose column name is not a
+            # known angle alias: use SPEC's first-data-column convention.
+            ctx["scan_col_idx"] = self._find_scan_col(cols, scan_motor)
+            ctx["scan_logical"] = self._resolve(scan_motor)
+            ctx["in_data"] = True
+
+        indices = list(hkl_idx.values())
+        indices.extend(ctx.get("angle_idx", {}).values())
+        if ctx.get("scan_col_idx") is not None:
+            indices.append(ctx["scan_col_idx"])
+        ctx["max_idx"] = max(indices, default=-1)
+        return ctx
+
+    def _build_record(self, cur_scan, counter, cur_type, current_ub, ctx, parts):
+        """Build one output record for a data row given the scan context."""
+
+        def _get(idx):
+            if idx is None:
+                return None
+            try:
+                return float(parts[idx])
+            except (IndexError, ValueError, TypeError):
+                return None
+
+        hkl_idx = ctx.get("hkl_idx", {})
+        rec = {
+            "scan_number": f"{cur_scan:03d}",
+            "data_number": f"{counter:03d}",
+            "type": cur_type,
+            "ub": current_ub.copy() if current_ub is not None else None,
+            "h": _get(hkl_idx.get("h")),
+            "k": _get(hkl_idx.get("k")),
+            "l": _get(hkl_idx.get("l")),
+        }
+
+        if ctx["type"] == "hklscan":
+            angle_idx = ctx.get("angle_idx", {})
+            for key in self.ANGLE_KEYS:
+                rec[key] = _get(angle_idx.get(key))
+        else:  # step scans: prefer per-row column values, fall back to fixed
+            fixed = ctx.get("fixed_angles", {})
+            angle_idx = ctx.get("angle_idx", {})
+            for key in self.ANGLE_KEYS:
+                val = _get(angle_idx.get(key)) if key in angle_idx else None
+                rec[key] = val if val is not None else fixed.get(key)
+            # Fallback: map the primary scanned motor by column position when
+            # its column name is not a recognized angle alias.
+            scan_logical = ctx.get("scan_logical")
+            if scan_logical in self.ANGLE_KEYS and rec.get(scan_logical) is None:
+                rec[scan_logical] = _get(ctx.get("scan_col_idx"))
+        return rec
 
     def to_pandas(self):
         data = self.parse_all_scans()
@@ -484,6 +576,7 @@ class SpecParser:
         setup_yaml: str,
         npartitions: int = 1,
         selected_scans=None,
+        axis_aliases=None,
     ):
         self.filename = filename
         self.setup = ExperimentSetup.from_yaml(setup_yaml)
@@ -493,6 +586,7 @@ class SpecParser:
             self.crystal,
             npartitions=npartitions,
             selected_scans=selected_scans,
+            axis_aliases=axis_aliases,
         )
 
     def to_pandas(self):
